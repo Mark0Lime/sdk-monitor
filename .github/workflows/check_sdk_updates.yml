@@ -9,12 +9,17 @@ concurrency:
   group: check-sdk-updates
   cancel-in-progress: false
 
+permissions:
+  contents: write
+
 jobs:
   check-release:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         repo:
           - "facebook/facebook-ios-sdk"
@@ -23,63 +28,114 @@ jobs:
           - "adjust/adjust_signature_sdk"
 
     steps:
-      - name: Debug PAT_TOKEN
-        run: |
-          if [ -n "${{ secrets.PAT_TOKEN }}" ]; then
-            echo "✅ PAT_TOKEN is set (first 5 chars): ${PAT_TOKEN:0:5}..."
-          else
-            echo "❌ PAT_TOKEN is not set"
-            exit 1
-          fi
+      - name: Check PAT_TOKEN exists
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          if [ -n "$PAT_TOKEN" ]; then
+            echo "✅ PAT_TOKEN is set"
+          else
+            echo "❌ PAT_TOKEN is not set"
+            echo "请到 Repository → Settings → Secrets and variables → Actions 添加 PAT_TOKEN"
+            exit 1
+          fi
+
+      - name: Verify PAT_TOKEN is valid
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          STATUS=$(curl -s -o /tmp/github_user.json -w "%{http_code}" \
+            -H "Authorization: Bearer $PAT_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/user)
+
+          if [ "$STATUS" != "200" ]; then
+            echo "❌ PAT_TOKEN 无效、已过期，或权限不足"
+            echo "GitHub API status: $STATUS"
+            cat /tmp/github_user.json
+            exit 1
+          fi
+
+          echo "✅ PAT_TOKEN is valid"
 
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure GitHub authentication for git commands
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${PAT_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git config --global url."https://x-access-token:${PAT_TOKEN}@github.com/".insteadOf "git@github.com:"
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+
+          echo "✅ GitHub authentication configured for git commands"
 
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq sendmail
+
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install --upgrade requests packaging setuptools
 
       - name: Verify installed dependencies
         run: |
+          echo "Python version:"
           python --version
-          pip --version
-          pip list | grep packaging || echo "❌ packaging 未安装"
 
-      - name: Verify check_release.py exists
+          echo "Pip version:"
+          pip --version
+
+          echo "Installed Python packages:"
+          pip list | grep -E "requests|packaging|setuptools" || true
+
+          echo "Git version:"
+          git --version
+
+          echo "jq version:"
+          jq --version
+
+      - name: Verify required files
         run: |
+          echo "当前工作目录: $(pwd)"
+          echo "当前目录文件:"
           ls -la
+
           if [ -f "check_release.py" ]; then
-            echo "✅ check_release.py found in root directory"
+            echo "✅ check_release.py found"
           else
             echo "❌ check_release.py not found in root directory"
             exit 1
           fi
 
-      - name: Verify versions.json exists
-        run: |
           if [ -f "versions.json" ]; then
-            echo "✅ versions.json found in root directory"
+            echo "✅ versions.json found"
+            echo "当前 versions.json 内容:"
             cat versions.json
           else
             echo "❌ versions.json not found in root directory"
             exit 1
           fi
 
-      - name: Debug REPO variable
+      - name: Debug current repo
         run: |
-          echo "REPO variable: ${{ matrix.repo }}"
+          echo "当前检查仓库: ${{ matrix.repo }}"
+
           if [ -z "${{ matrix.repo }}" ]; then
-            echo "❌ REPO variable is not set"
+            echo "❌ matrix.repo is empty"
             exit 1
           fi
 
@@ -90,50 +146,79 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           echo "当前工作目录: $(pwd)"
-          echo "环境变量 REPO: $REPO"
-          echo "环境变量 GITHUB_TOKEN: ${GITHUB_TOKEN:0:5}..."
+          echo "当前检查仓库: $REPO"
+
           python check_release.py
 
-      - name: Commit updated versions.json
+          echo "检查完成"
+          echo "VERSION_UPDATED=${VERSION_UPDATED:-false}"
+          echo "SDK=${SDK:-}"
+          echo "NEW_VERSION=${NEW_VERSION:-}"
+          echo "RELEASE_URL=${RELEASE_URL:-}"
+
+      - name: Commit and push updated versions.json
         if: env.VERSION_UPDATED == 'true'
+        env:
+          REPO: ${{ matrix.repo }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          git config --global user.name "GitHub Action"
-          git config --global user.email "action@github.com"
-          echo "🔍 Debugging working directory state before commit..."
+          echo "🔍 提交前状态:"
           git status
+          echo "当前 versions.json 内容:"
           cat versions.json
-          
+
+          if git diff --quiet -- versions.json; then
+            echo "⚠️ VERSION_UPDATED=true，但 versions.json 没有实际变化，跳过提交"
+            exit 0
+          fi
+
           git add versions.json
-          git commit -m "Update versions.json with new SDK version: ${{ env.SDK }}@${{ env.NEW_VERSION }}"
-          
+          git commit -m "Update versions.json: ${{ env.SDK }}@${{ env.NEW_VERSION }}"
+
           success=false
-          for i in {1..3}; do
+
+          for i in 1 2 3; do
+            echo "🚀 Push attempt $i/3"
+
             if git push; then
               success=true
+              echo "✅ Push succeeded"
               break
             fi
-            echo "Push failed, retrying ($i/3)..."
+
+            echo "⚠️ Push failed, retrying after rebase..."
             git fetch origin
-            if git pull --rebase; then
-              git add versions.json
-              git commit --allow-empty -m "Update versions.json with new SDK version: ${{ env.SDK }}@${{ env.NEW_VERSION }} after failed push"
+
+            CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+            echo "当前分支: $CURRENT_BRANCH"
+
+            if git pull --rebase origin "$CURRENT_BRANCH"; then
+              echo "✅ Rebase succeeded"
             else
-              echo "⚠️ Rebase 失败，重置到最新 main 分支"
+              echo "⚠️ Rebase failed, aborting and resetting to origin/$CURRENT_BRANCH"
               git rebase --abort || true
-              git reset --hard origin/main
+              git reset --hard "origin/$CURRENT_BRANCH"
+
+              echo "重新执行 check_release.py"
               python check_release.py
+
+              if git diff --quiet -- versions.json; then
+                echo "⚠️ 重试后 versions.json 没有变化，跳过提交"
+                success=true
+                break
+              fi
+
               git add versions.json
-              git commit -m "Update versions.json with new SDK version: ${{ env.SDK }}@${{ env.NEW_VERSION }} after failed push"
+              git commit -m "Update versions.json after rebase: ${{ env.SDK }}@${{ env.NEW_VERSION }}"
             fi
+
             sleep $((i * 5))
           done
+
           if [ "$success" != "true" ]; then
             echo "❌ Failed to push after 3 retries"
             exit 1
           fi
-        env:
-          REPO: ${{ matrix.repo }}
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
 
       - name: Revert versions.json on failure
         if: failure()
@@ -148,7 +233,7 @@ jobs:
       - name: Send GitHub Notification
         if: env.VERSION_UPDATED == 'true'
         run: |
-          echo "::notice title=SDK 更新通知::🚀 新版本: ${{ env.NEW_VERSION }} 🔗 [查看](${{ env.RELEASE_URL }}) 📦 SDK: ${{ env.SDK }}"
+          echo "::notice title=SDK 更新通知::🚀 新版本: ${{ env.NEW_VERSION }} 🔗 ${{ env.RELEASE_URL }} 📦 SDK: ${{ env.SDK }}"
 
       - name: Send Email Notification
         if: env.VERSION_UPDATED == 'true'
@@ -159,13 +244,21 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
         run: |
-          if [ -n "$SMTP_SERVER" ]; then
+          if [ -n "$SMTP_SERVER" ] && [ -n "$TO_EMAIL" ]; then
             echo "Sending email notification..."
+
             SUBJECT="SDK 更新: $SDK $NEW_VERSION"
             BODY="新版本发布: $SDK\n\n版本号: $NEW_VERSION\n下载链接: $RELEASE_URL"
-            echo -e "Subject:$SUBJECT\n\n$BODY" | sendmail -v $TO_EMAIL || echo "❌ 邮件发送失败"
+
+            {
+              echo "Subject: $SUBJECT"
+              echo "To: $TO_EMAIL"
+              echo "Content-Type: text/plain; charset=UTF-8"
+              echo ""
+              echo -e "$BODY"
+            } | sendmail -v "$TO_EMAIL" || echo "❌ 邮件发送失败"
           else
-            echo "❌ SMTP 未配置，跳过邮件发送"
+            echo "❌ SMTP_SERVER 或 TO_EMAIL 未配置，跳过邮件发送"
           fi
 
       - name: Send Telegram Notification
@@ -175,18 +268,21 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-            MESSAGE="""🚀 *新版本发布*
+            MESSAGE="🚀 *新版本发布*
             📦 SDK: \`${SDK}\`
             🔖 版本号: \`${NEW_VERSION}\`
-            🔗 [点击查看](${RELEASE_URL})"""
-            
-            JSON=$(jq -n --arg chat_id "$TELEGRAM_CHAT_ID" --arg text "$MESSAGE" '{chat_id: $chat_id, text: $text, parse_mode: "Markdown"}')
+            🔗 [点击查看](${RELEASE_URL})"
 
-            curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+            JSON=$(jq -n \
+              --arg chat_id "$TELEGRAM_CHAT_ID" \
+              --arg text "$MESSAGE" \
+              '{chat_id: $chat_id, text: $text, parse_mode: "Markdown"}')
+
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -H "Content-Type: application/json" \
               -d "$JSON"
 
             echo "✅ Telegram 通知已发送"
           else
-            echo "❌ Telegram Token 或 Chat ID 未配置"
+            echo "❌ Telegram Token 或 Chat ID 未配置，跳过 Telegram 通知"
           fi
