@@ -157,68 +157,62 @@ jobs:
           echo "RELEASE_URL=${RELEASE_URL:-}"
 
       - name: Commit and push updated versions.json
-        if: env.VERSION_UPDATED == 'true'
-        env:
-          REPO: ${{ matrix.repo }}
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: |
-          echo "🔍 提交前状态:"
-          git status
-          echo "当前 versions.json 内容:"
-          cat versions.json
+  run: |
+    echo "🔍 提交前状态:"
+    git status
 
-          if git diff --quiet -- versions.json; then
-            echo "⚠️ VERSION_UPDATED=true，但 versions.json 没有实际变化，跳过提交"
-            exit 0
-          fi
+    if git diff --quiet -- versions.json; then
+      echo "✅ versions.json 没有变化，跳过提交"
+      exit 0
+    fi
 
-          git add versions.json
-          git commit -m "Update versions.json: ${{ env.SDK }}@${{ env.NEW_VERSION }}"
+    git add versions.json
+    git commit -m "Update versions.json for ${{ matrix.repo }}"
 
-          success=false
+    success=false
 
-          for i in 1 2 3; do
-            echo "🚀 Push attempt $i/3"
+    for i in 1 2 3; do
+      echo "🚀 Push attempt $i/3"
 
-            if git push; then
-              success=true
-              echo "✅ Push succeeded"
-              break
-            fi
+      if git push; then
+        success=true
+        echo "✅ Push succeeded"
+        break
+      fi
 
-            echo "⚠️ Push failed, retrying after rebase..."
-            git fetch origin
+      echo "⚠️ Push failed, retrying after rebase..."
+      git fetch origin
 
-            CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-            echo "当前分支: $CURRENT_BRANCH"
+      CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
-            if git pull --rebase origin "$CURRENT_BRANCH"; then
-              echo "✅ Rebase succeeded"
-            else
-              echo "⚠️ Rebase failed, aborting and resetting to origin/$CURRENT_BRANCH"
-              git rebase --abort || true
-              git reset --hard "origin/$CURRENT_BRANCH"
+      if git pull --rebase origin "$CURRENT_BRANCH"; then
+        echo "✅ Rebase succeeded"
+      else
+        echo "⚠️ Rebase failed"
+        git rebase --abort || true
+        git reset --hard "origin/$CURRENT_BRANCH"
+        python check_release.py
 
-              echo "重新执行 check_release.py"
-              python check_release.py
+        if git diff --quiet -- versions.json; then
+          echo "✅ 重试后 versions.json 没有变化，跳过提交"
+          success=true
+          break
+        fi
 
-              if git diff --quiet -- versions.json; then
-                echo "⚠️ 重试后 versions.json 没有变化，跳过提交"
-                success=true
-                break
-              fi
+        git add versions.json
+        git commit -m "Update versions.json for ${{ matrix.repo }} after rebase"
+      fi
 
-              git add versions.json
-              git commit -m "Update versions.json after rebase: ${{ env.SDK }}@${{ env.NEW_VERSION }}"
-            fi
+      sleep $((i * 5))
+    done
 
-            sleep $((i * 5))
-          done
-
-          if [ "$success" != "true" ]; then
-            echo "❌ Failed to push after 3 retries"
-            exit 1
-          fi
+    if [ "$success" != "true" ]; then
+      echo "❌ Failed to push after 3 retries"
+      exit 1
+    fi
+  env:
+    REPO: ${{ matrix.repo }}
+    GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
 
       - name: Revert versions.json on failure
         if: failure()
