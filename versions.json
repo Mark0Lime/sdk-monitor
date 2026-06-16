@@ -1,6 +1,6 @@
 {
   "facebook_facebook-ios-sdk": "v18.0.3",
   "adjust_ios_sdk": "v5.7.0",
-  "firebase_firebase-ios-sdk": "12.14.0",
+  "firebase_firebase-ios-sdk": "12.15.0",
   "adjust_adjust_signature_sdk": "v3.67.0-beta"
 }
